@@ -3,9 +3,14 @@
 A site analysis tool for England, built on Mapbox GL JS v3 and open data.
 
 Workflow: **find the place → draw the red line → set the study area → analyse**. Then:
-- move between **Plan / 3D / Axonometric / Eye level**, with the selected building linked to its card by a leader line
+- move between **Plan / 3D / Axonometric / Atlas / Eye level**, with the selected building linked to its card by a leader line
+- **Atlas** lifts every building in the study area out of the map into a true-scale grid in reference order (animated; still clickable)
+- buildings **grow out of the ground**, rippling outward from the site, when you enter Axonometric or 3D
+- **Start again** clears the search, red line, study area and analysis and returns to a clean plan
 - open a **building passport** (A3, print or save as PDF)
-- export an **axonometric or plan drawing as SVG** (editable in Illustrator or InDesign) or PNG
+- export an **axonometric, atlas sheet or plan drawing as SVG** (editable in Illustrator or InDesign) or PNG
+
+Type is Plus Jakarta Sans throughout (UI, passport and SVG exports). Map labels use Mapbox's own fonts.
 
 ## Run it
 
@@ -43,7 +48,8 @@ Open http://localhost:5173. To deploy, run `npm run build` and serve `dist/` fro
 ## Code map
 
 ```
-src/main.ts      UI, map layers, views, selection + leader line, export
+src/main.ts      UI, map layers, views, animations, selection + leader line, export
+src/atlas.ts     Atlas layout (true-scale shelf packing) + geometry translation
 src/tiles.ts     Mapbox Streets vector-tile extraction (buildings, roads, landuse, water, POIs)
 src/model.ts     The site model: numbered buildings, local metric geometry, designations per building
 src/axo.ts       SVG axonometric / plan renderer

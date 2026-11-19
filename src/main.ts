@@ -13,16 +13,18 @@ import { buildModel, modelGeoJSON, GREEN, type SiteModel, type Bldg } from './mo
 import { fetchPois, fetchBuildingAt, reverseGeocode, type Poi } from './osm';
 import { renderAxo, groundLayers, LOOK, type AxoBuilding, type GroundPolys } from './axo';
 import { openPassport, useLabel } from './passport';
-import { fmtArea, fmtDist, toLocalPolys, type XY } from './geo';
+import { layoutAtlas, translateFeature, ease, type AtlasLayout } from './atlas';
+import { fmtArea, fmtDist, toLocalPolys, type XY, type LocalPoly } from './geo';
 
 const TOKEN = import.meta.env.VITE_MAPBOX_TOKEN as string;
 mapboxgl.accessToken = TOKEN;
 
 type PolyF = Feature<Polygon | MultiPolygon>;
-type View = 'plan' | '3d' | 'axo' | 'eye';
+type View = 'plan' | '3d' | 'axo' | 'atlas' | 'eye';
 const $ = <T extends HTMLElement = HTMLElement>(s: string) => document.querySelector<T>(s)!;
 const empty: FeatureCollection = { type: 'FeatureCollection', features: [] };
 const esc = (s: unknown) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]!);
+const HOME = { center: [-2.2557, 53.4776] as [number, number], zoom: 16 };
 
 const S = {
   red: null as PolyF | null,
@@ -34,6 +36,7 @@ const S = {
   walk: empty as FeatureCollection,
   drawing: null as null | 'red' | 'study',
   model: null as SiteModel | null,
+  modelFC: empty as FeatureCollection,
   designations: empty as FeatureCollection,
   pois: [] as Poi[],
   place: '',
@@ -41,15 +44,18 @@ const S = {
   selected: null as Bldg | null,
   view: 'plan' as View,
   visible: new Set<string>([...DATASETS.filter((d) => d.on).map((d) => d.id), 'walk', 'pois']),
+  openGroups: new Set<string>(),
   massing: 0,
+  atlas: null as AtlasLayout | null,
+  atlasT: 0,
 };
 
 // ---------------------------------------------------------------- map
 const map = new mapboxgl.Map({
   container: 'map',
   style: 'mapbox://styles/mapbox/light-v11',
-  center: [-2.2557, 53.4776],
-  zoom: 16,
+  center: HOME.center,
+  zoom: HOME.zoom,
   preserveDrawingBuffer: true,
   antialias: true,
   maxZoom: 25, // eye level needs the camera within ~16 m of its look-at point
@@ -68,62 +74,56 @@ const draw = new MapboxDraw({
 });
 map.addControl(draw);
 
-function addLayers() {
-  // Quieter base: a drawing, not a map app.
+// Figure-ground base: white ground, pale streets, blue water, grey buildings.
+function styleBase() {
   for (const l of map.getStyle()!.layers ?? []) {
-    if (l.type === 'symbol' && /poi|transit|airport|natural|water-point|settlement-subdivision/.test(l.id)) map.setLayoutProperty(l.id, 'visibility', 'none');
+    const id = l.id;
+    try {
+      if (l.type === 'symbol' && /poi|transit|airport|natural|water-point|settlement-subdivision|waterway-label|water-line-label/.test(id)) map.setLayoutProperty(id, 'visibility', 'none');
+      if (l.type === 'background') map.setPaintProperty(id, 'background-color', '#ffffff');
+      if ((id === 'land' || id === 'landcover') && l.type === 'fill') map.setPaintProperty(id, 'fill-color', '#ffffff');
+      if (/^(landuse|national-park)/.test(id) && l.type === 'fill') map.setPaintProperty(id, 'fill-color', '#f1f3ee');
+      if (/^(water|waterway)/.test(id)) map.setPaintProperty(id, l.type === 'fill' ? 'fill-color' : 'line-color', '#bcd5e9');
+      if (l.type === 'line' && /^(road|bridge|tunnel)/.test(id) && !/label/.test(id)) map.setPaintProperty(id, 'line-color', /path|steps|pedestrian/.test(id) ? '#e2e2e2' : '#ebebeb');
+      if (l.type === 'line' && /case/.test(id)) map.setPaintProperty(id, 'line-color', '#e3e3e3');
+      if (id === 'building') map.setPaintProperty(id, 'fill-color', '#cfcfcf');
+      if (id === 'building-outline' || id === 'building-underground') map.setLayoutProperty(id, 'visibility', 'none');
+    } catch { /* layer without that property */ }
   }
-  if (map.getLayer('building')) map.setPaintProperty('building', 'fill-color', '#dddcd7');
+}
 
-  map.addSource('mask', { type: 'geojson', data: empty });
-  map.addSource('red', { type: 'geojson', data: empty });
-  map.addSource('study', { type: 'geojson', data: empty });
-  map.addSource('walk', { type: 'geojson', data: empty });
-  map.addSource('model', { type: 'geojson', data: empty });
-  map.addSource('pois', { type: 'geojson', data: empty });
-  map.addSource('selected', { type: 'geojson', data: empty });
+const growExpr = (prop: string, T: number): any => [
+  '*', ['get', prop],
+  ['let', 'f', ['min', 1, ['max', 0, ['/', ['-', T, ['*', ['get', 'd'], 0.65]], 0.35]]], ['*', ['var', 'f'], ['var', 'f'], ['-', 3, ['*', 2, ['var', 'f']]]]],
+];
 
-  map.addLayer({ id: 'mask', type: 'fill', source: 'mask', paint: { 'fill-color': '#fbfaf7', 'fill-opacity': 0.6 } });
+function addLayers() {
+  styleBase();
+  map.setFog(null as any); // fog greys out the pitched views; drawings want a clean white ground
+  for (const id of ['mask', 'red', 'study', 'walk', 'model', 'pois', 'selected', 'massing', 'atlas-labels']) map.addSource(id, { type: 'geojson', data: empty });
 
   for (const d of DATASETS) {
     map.addSource(`ds-${d.id}`, { type: 'geojson', data: empty });
     if (d.kind === 'fill') {
       const color: any = d.id === 'flood-risk-zone' ? ['match', ['to-string', ['get', 'flood-risk-level']], '3', '#1f5fc4', '#7fb2f0'] : d.color;
-      map.addLayer({ id: `ds-${d.id}-f`, type: 'fill', source: `ds-${d.id}`, paint: { 'fill-color': color, 'fill-opacity': 0.16 } });
-      map.addLayer({ id: `ds-${d.id}-l`, type: 'line', source: `ds-${d.id}`, paint: { 'line-color': color, 'line-width': 1.6, 'line-dasharray': [3, 2] } });
+      map.addLayer({ id: `ds-${d.id}-f`, type: 'fill', source: `ds-${d.id}`, paint: { 'fill-color': color, 'fill-opacity': 0.08 } });
+      map.addLayer({ id: `ds-${d.id}-l`, type: 'line', source: `ds-${d.id}`, paint: { 'line-color': color, 'line-width': 1.5, 'line-dasharray': [3, 2] } });
     }
   }
-
-  map.moveLayer('mask'); // mask sits over the designations so the study area reads clearly
-  map.addLayer({ id: 'walk', type: 'line', source: 'walk', paint: { 'line-color': '#1b1b1b', 'line-width': ['match', ['get', 'contour'], 5, 1.6, 10, 1.2, 0.8], 'line-dasharray': [1, 2], 'line-opacity': 0.7 } });
-  map.addLayer({ id: 'study-line', type: 'line', source: 'study', paint: { 'line-color': '#141414', 'line-width': 1.2, 'line-dasharray': [6, 3] } });
-  map.addLayer({ id: 'red-fill', type: 'fill', source: 'red', paint: { 'fill-color': '#d7262e', 'fill-opacity': 0.07 } });
+  map.addLayer({ id: 'mask', type: 'fill', source: 'mask', paint: { 'fill-color': '#ffffff', 'fill-opacity': 0.55 } });
+  map.addLayer({ id: 'walk', type: 'line', source: 'walk', paint: { 'line-color': '#f08a1c', 'line-width': ['match', ['get', 'contour'], 5, 1.6, 10, 1.3, 1], 'line-dasharray': [1, 2] } });
+  map.addLayer({ id: 'study-line', type: 'line', source: 'study', paint: { 'line-color': '#141414', 'line-width': 1.1, 'line-dasharray': [7, 3, 1, 3] } });
+  map.addLayer({ id: 'red-fill', type: 'fill', source: 'red', paint: { 'fill-color': '#d7262e', 'fill-opacity': 0.06 } });
   map.addLayer({ id: 'red-line', type: 'line', source: 'red', paint: { 'line-color': '#d7262e', 'line-width': 3 } });
   map.addLayer({ id: 'selected-line', type: 'line', source: 'selected', paint: { 'line-color': '#2433e0', 'line-width': 3 } });
 
   map.addLayer({
     id: 'context-3d', type: 'fill-extrusion', source: 'composite', 'source-layer': 'building', minzoom: 14,
     filter: ['==', ['get', 'extrude'], 'true'],
-    paint: { 'fill-extrusion-color': '#e8e7e2', 'fill-extrusion-height': ['get', 'height'], 'fill-extrusion-base': ['get', 'min_height'], 'fill-extrusion-opacity': 0.9 },
+    layout: { visibility: 'none' },
+    paint: { 'fill-extrusion-color': '#ecebe7', 'fill-extrusion-height': ['get', 'height'], 'fill-extrusion-base': ['get', 'min_height'], 'fill-extrusion-opacity': 0.92 },
   });
-  map.addLayer({
-    id: 'model-3d', type: 'fill-extrusion', source: 'model',
-    paint: {
-      'fill-extrusion-color': [
-        'case',
-        ['boolean', ['feature-state', 'selected'], false], '#2433e0',
-        ['boolean', ['feature-state', 'hover'], false], '#9aa3ff',
-        ['get', 'listed'], '#c9b2de',
-        ['get', 'inSite'], '#f1b2b5',
-        ['get', 'inStudy'], '#ffffff',
-        '#e3e2dd',
-      ],
-      'fill-extrusion-height': ['get', 'h'],
-      'fill-extrusion-base': ['get', 'minH'],
-      'fill-extrusion-opacity': 0.96,
-    },
-  });
-  map.addSource('massing', { type: 'geojson', data: empty });
+  map.addLayer({ id: 'model-3d', type: 'fill-extrusion', source: 'model', paint: { 'fill-extrusion-height': ['get', 'h'], 'fill-extrusion-base': ['get', 'minH'], 'fill-extrusion-opacity': 0.97 } });
   map.addLayer({ id: 'massing-3d', type: 'fill-extrusion', source: 'massing', paint: { 'fill-extrusion-color': '#e6262e', 'fill-extrusion-height': ['get', 'h'], 'fill-extrusion-opacity': 0.75 } });
 
   map.addLayer({
@@ -135,15 +135,35 @@ function addLayers() {
     id: 'pois', type: 'circle', source: 'pois',
     paint: {
       'circle-radius': ['match', ['get', 'cat'], 'rail', 6, 'bus', 3, 3.5],
-      'circle-color': ['match', ['get', 'cat'], 'rail', '#141414', 'bus', '#555', 'shop', '#d08a00', 'school', '#2b7bb9', 'health', '#c0392b', 'park', '#3f8f3f', '#888'],
+      'circle-color': ['match', ['get', 'cat'], 'rail', '#141414', 'bus', '#555', 'shop', '#f08a1c', 'school', '#2b7bb9', 'health', '#c0392b', 'park', '#3f8f3f', '#888'],
       'circle-stroke-color': '#fff', 'circle-stroke-width': 1.2,
     },
   });
-  map.addLayer({ id: 'pois-label', type: 'symbol', source: 'pois', filter: ['==', ['get', 'cat'], 'rail'], layout: { 'text-field': ['get', 'name'], 'text-size': 11, 'text-offset': [0, 1.1], 'text-anchor': 'top', 'text-font': ['DIN Pro Medium', 'Arial Unicode MS Regular'] }, paint: { 'text-color': '#141414', 'text-halo-color': '#fff', 'text-halo-width': 1.5 } });
+  const font = ['DIN Pro Medium', 'Arial Unicode MS Regular'];
+  map.addLayer({ id: 'pois-label', type: 'symbol', source: 'pois', filter: ['==', ['get', 'cat'], 'rail'], layout: { 'text-field': ['get', 'name'], 'text-size': 11, 'text-offset': [0, 1.1], 'text-anchor': 'top', 'text-font': font }, paint: { 'text-color': '#141414', 'text-halo-color': '#fff', 'text-halo-width': 1.5 } });
+  map.addLayer({ id: 'atlas-labels', type: 'symbol', source: 'atlas-labels', layout: { 'text-field': ['get', 'text'], 'text-size': 10.5, 'text-anchor': 'top-left', 'text-font': font, 'text-letter-spacing': 0.06, 'text-allow-overlap': true }, paint: { 'text-color': '#141414' } });
 
+  unlitFlatLayers();
+  setModelColours();
   applySun();
   applyVisibility();
   restoreProject();
+}
+
+/** Mapbox v3 lights also dim flat layers; keep the ground, lines and labels at full brightness so only buildings take light. */
+function unlitFlatLayers() {
+  const props: Record<string, string[]> = {
+    background: ['background-emissive-strength'],
+    fill: ['fill-emissive-strength'],
+    line: ['line-emissive-strength'],
+    circle: ['circle-emissive-strength'],
+    symbol: ['icon-emissive-strength', 'text-emissive-strength'],
+  };
+  for (const l of map.getStyle()?.layers ?? [])
+    for (const prop of props[l.type] ?? [])
+      try {
+        map.setPaintProperty(l.id, prop as any, 1);
+      } catch { /* not supported on this layer */ }
 }
 
 map.on('style.load', () => {
@@ -151,11 +171,30 @@ map.on('style.load', () => {
   map.setCamera({ 'camera-projection': 'orthographic' });
 });
 
+/** Plan reads as figure-ground (black buildings); the 3D views read as a white model. */
+function setModelColours() {
+  if (!map.getLayer('model-3d')) return;
+  const sel = ['boolean', ['feature-state', 'selected'], false], hov = ['boolean', ['feature-state', 'hover'], false];
+  const plan = S.view === 'plan';
+  const listedOn = S.visible.has('listed-building');
+  map.setPaintProperty('model-3d', 'fill-extrusion-color', [
+    'case',
+    sel, '#2433e0',
+    hov, plan ? '#4d58f0' : '#9aa3ff',
+    ['all', ['get', 'listed'], listedOn], plan ? '#5d3d7d' : '#c9b2de',
+    ['get', 'inSite'], plan ? '#1a1a1a' : '#f1b2b5',
+    ['get', 'inStudy'], plan ? '#232323' : '#ffffff',
+    plan ? '#c9c9c9' : '#e3e2dd',
+  ] as any);
+}
+
 // ---------------------------------------------------------------- search
 let searchT = 0;
-$('#search').addEventListener('input', (e) => {
+const searchBox = $<HTMLInputElement>('#search');
+searchBox.addEventListener('input', () => {
   clearTimeout(searchT);
-  const q = (e.target as HTMLInputElement).value.trim();
+  const q = searchBox.value.trim();
+  $('#clearSearch').hidden = !searchBox.value;
   if (q.length < 3) return void ($('#results').innerHTML = '');
   searchT = window.setTimeout(async () => {
     const r = await fetch(`https://api.mapbox.com/search/geocode/v6/forward?q=${encodeURIComponent(q)}&country=gb&autocomplete=true&limit=6&access_token=${TOKEN}`);
@@ -168,18 +207,27 @@ $('#search').addEventListener('input', (e) => {
         const f = j.features[+li.dataset.i!];
         map.flyTo({ center: f.geometry.coordinates, zoom: 17.2, pitch: 0, bearing: 0 });
         S.place = f.properties.context?.place?.name ?? f.properties.name;
+        searchBox.value = f.properties.name;
         $('#results').innerHTML = '';
       }),
     );
   }, 250);
 });
+$('#clearSearch').onclick = () => {
+  searchBox.value = '';
+  $('#results').innerHTML = '';
+  $('#clearSearch').hidden = true;
+  searchBox.focus();
+};
 
 $('#example').onclick = () => {
-  // A block in Castlefield, Manchester, to show the workflow end to end.
+  resetAll(false);
   setRed(turf.polygon([[[-2.25668, 53.47735], [-2.25545, 53.47783], [-2.25492, 53.47729], [-2.25611, 53.47683], [-2.25668, 53.47735]]]) as PolyF);
   S.place = 'Castlefield, Manchester';
-  map.fitBounds(turf.bbox(S.study!) as any, { padding: 60, duration: 800 });
+  searchBox.value = S.place;
+  map.fitBounds(turf.bbox(S.study!) as any, { padding: 60, pitch: 0, bearing: 0, duration: 800 });
 };
+$('#reset').onclick = () => resetAll(true);
 
 // ---------------------------------------------------------------- drawing
 function startDraw(kind: 'red' | 'study') {
@@ -223,9 +271,11 @@ map.on('draw.modechange', (e: any) => {
 });
 
 $<HTMLInputElement>('#importRed').onchange = async (e) => {
-  const file = (e.target as HTMLInputElement).files?.[0];
+  const input = e.target as HTMLInputElement;
+  const file = input.files?.[0];
   if (!file) return;
   const text = await file.text();
+  input.value = '';
   let poly: PolyF | null = null;
   if (file.name.toLowerCase().endsWith('.kml')) {
     const doc = new DOMParser().parseFromString(text, 'text/xml');
@@ -261,8 +311,7 @@ $<HTMLInputElement>('#massing').oninput = (e) => {
   updateMassing();
 };
 function updateMassing() {
-  const src = map.getSource('massing') as mapboxgl.GeoJSONSource | undefined;
-  src?.setData(S.red && S.massing > 0 ? { ...S.red, properties: { h: S.massing } } : empty);
+  (map.getSource('massing') as mapboxgl.GeoJSONSource | undefined)?.setData(S.red && S.massing > 0 ? { ...S.red, properties: { h: S.massing } } : empty);
 }
 
 // ---------------------------------------------------------------- study area
@@ -276,7 +325,7 @@ document.querySelectorAll<HTMLButtonElement>('#studyMode button').forEach((b) =>
 );
 $<HTMLInputElement>('#bufferM').oninput = (e) => {
   S.bufferM = +(e.target as HTMLInputElement).value;
-  $('#bufferLbl').textContent = `${S.bufferM} m`;
+  $('#bufferLbl').textContent = `${S.bufferM} m around the red line`;
   updateStudy();
 };
 document.querySelectorAll<HTMLButtonElement>('#walkMin button').forEach((b) =>
@@ -297,7 +346,7 @@ async function updateStudy() {
     const fc = await isochrone(S.red);
     if (seq !== studySeq) return;
     const hit = fc.features.find((f) => f.properties?.contour === S.walkMin) as PolyF | undefined;
-    if (hit) study = turf.union(turf.featureCollection([hit, S.red as any])) as PolyF ?? hit;
+    if (hit) study = (turf.union(turf.featureCollection([hit, S.red as any])) as PolyF) ?? hit;
   }
   S.study = study;
   (map.getSource('study') as mapboxgl.GeoJSONSource)?.setData(study ?? empty);
@@ -308,6 +357,7 @@ async function updateStudy() {
       : `Study area ${fmtArea(turf.area(study))}, no red line`
     : '';
   $<HTMLButtonElement>('#analyse').disabled = !study;
+  renderLegend();
 }
 
 const walkCache = new Map<string, FeatureCollection>();
@@ -321,18 +371,22 @@ async function isochrone(f: PolyF): Promise<FeatureCollection> {
   return walkCache.get(key)!;
 }
 
-function maskOf(study: PolyF): Feature<Polygon> {
+const WORLD = [[-180, -85], [180, -85], [180, 85], [-180, 85], [-180, -85]];
+function maskOf(study: PolyF | null): Feature<Polygon> {
+  if (!study) return turf.polygon([WORLD]);
   const holes = study.geometry.type === 'Polygon' ? [study.geometry.coordinates[0]] : study.geometry.coordinates.map((p) => p[0]);
-  return turf.polygon([[[-180, -85], [180, -85], [180, 85], [-180, 85], [-180, -85]], ...holes.map((h) => (turf.booleanClockwise(h) ? h : h.slice().reverse()))]);
+  return turf.polygon([WORLD, ...holes.map((h) => (turf.booleanClockwise(h) ? h : h.slice().reverse()))]);
 }
 
 // ---------------------------------------------------------------- analysis
 $('#analyse').onclick = analyse;
+let analyseSeq = 0;
 async function analyse() {
   if (!S.study) return;
+  const seq = ++analyseSeq;
   const btn = $<HTMLButtonElement>('#analyse');
   btn.disabled = true;
-  const say = (t: string) => ($('#progress').textContent = t);
+  const say = (t: string) => seq === analyseSeq && ($('#progress').textContent = t);
   try {
     const context = turf.buffer(S.study, 120, { units: 'meters' }) as PolyF;
     const ctxBox = turf.bbox(context);
@@ -349,12 +403,16 @@ async function analyse() {
     const streets = await fetchStreets(ctxBox, TOKEN, say);
     say('Reading designations…');
     const ds = await dsP;
+    if (seq !== analyseSeq) return;
     S.designations = { type: 'FeatureCollection', features: ds.flatMap((x) => x.features) };
     DATASETS.forEach((d, i) => (map.getSource(`ds-${d.id}`) as mapboxgl.GeoJSONSource).setData(ds[i]));
 
     say('Building the site model…');
     S.model = buildModel(streets, S.study, S.red, context, S.designations);
-    (map.getSource('model') as mapboxgl.GeoJSONSource).setData(modelGeoJSON(S.model));
+    S.modelFC = modelGeoJSON(S.model);
+    S.atlas = null;
+    S.atlasT = 0;
+    (map.getSource('model') as mapboxgl.GeoJSONSource).setData(S.modelFC);
 
     S.pois = await poiP;
     (map.getSource('pois') as mapboxgl.GeoJSONSource).setData({
@@ -371,103 +429,161 @@ async function analyse() {
     S.lpa = await lpaP;
     const pl = await placeP;
     if (pl) S.place = [pl.street, pl.place].filter(Boolean).join(', ');
+    if (seq !== analyseSeq) return;
 
     map.setLayoutProperty('context-3d', 'visibility', 'none');
     renderLayerList();
     applyVisibility();
     renderSummary();
+    renderLegend();
     select(null);
-    ['#expAxo', '#expPlan'].forEach((s) => ($<HTMLButtonElement>(s).disabled = false));
-    const n = S.model.buildings.filter((b) => b.inStudy).length;
-    say(`${n} buildings in the study area · tiles z${streets.zoom}`);
+    ['#expAxo', '#expPlan', '#expAtlas'].forEach((s) => ($<HTMLButtonElement>(s).disabled = false));
+    say('');
+    if (S.view === 'axo' || S.view === '3d') animateGrow();
   } catch (e) {
     console.error(e);
     say(`Something failed: ${(e as Error).message}`);
   } finally {
-    btn.disabled = false;
+    btn.disabled = !S.study;
   }
 }
 
-// ---------------------------------------------------------------- layers panel
+// ---------------------------------------------------------------- start again
+function resetAll(home: boolean) {
+  analyseSeq++;
+  studySeq++;
+  cancelAnimationFrame(growRAF);
+  cancelAnimationFrame(atlasRAF);
+  select(null);
+  draw.deleteAll();
+  Object.assign(S, {
+    red: null, study: null, drawnStudy: null, drawing: null, model: null, modelFC: empty, designations: empty,
+    pois: [], place: '', lpa: null, walk: empty, massing: 0, atlas: null, atlasT: 0,
+  });
+  for (const id of ['mask', 'red', 'study', 'walk', 'model', 'pois', 'selected', 'massing', 'atlas-labels', ...DATASETS.map((d) => `ds-${d.id}`)])
+    (map.getSource(id) as mapboxgl.GeoJSONSource | undefined)?.setData(empty);
+  searchBox.value = '';
+  $('#results').innerHTML = '';
+  $('#clearSearch').hidden = true;
+  $<HTMLInputElement>('#massing').value = '0';
+  $('#progress').textContent = '';
+  $('#area').hidden = true;
+  $('#area').innerHTML = '';
+  ['#expAxo', '#expPlan', '#expAtlas'].forEach((s) => ($<HTMLButtonElement>(s).disabled = true));
+  setRed(null);
+  try {
+    localStorage.removeItem(KEY);
+  } catch { /* storage blocked */ }
+  if (map.getLayer('building')) map.setLayoutProperty('building', 'visibility', 'visible');
+  S.view = 'plan';
+  setView('plan', { quiet: true });
+  map.easeTo({ pitch: 0, bearing: 0, ...(home ? { zoom: Math.min(map.getZoom(), 16) } : {}), duration: 600 });
+  renderLayerList();
+  renderLegend();
+}
+
+// ---------------------------------------------------------------- layers (accordions)
+const GROUPS = ['Heritage', 'Environment', 'Planning', 'Movement'] as const;
 function renderLayerList() {
   const counts = new Map<string, number>();
   const study = S.study;
-  for (const f of S.designations.features) {
-    const id = f.properties?.dataset;
-    if (study && f.geometry && safe(() => turf.booleanIntersects(f as any, study), false)) counts.set(id, (counts.get(id) ?? 0) + 1);
-  }
-  const groups = ['Heritage', 'Environment', 'Planning'] as const;
-  let html = '';
-  for (const g of groups) {
-    html += `<div class="lyr-group">${g}</div>`;
-    for (const d of DATASETS.filter((x) => x.group === g)) {
-      const n = counts.get(d.id) ?? 0;
-      html += `<label class="lyr"><input type="checkbox" data-l="${d.id}" ${S.visible.has(d.id) ? 'checked' : ''}/><span class="sw ${d.kind === 'point' ? 'pt' : ''}" style="border-color:${d.color};background:${d.color}33"></span>${d.label}<span class="n">${S.model ? n : ''}</span></label>`;
+  if (study)
+    for (const f of S.designations.features) {
+      const id = f.properties?.dataset;
+      if (f.geometry && safe(() => turf.booleanIntersects(f as any, study), false)) counts.set(id, (counts.get(id) ?? 0) + 1);
     }
+  const row = (id: string, label: string, color: string, point: boolean, n: string) =>
+    `<label class="lyr"><input type="checkbox" data-l="${id}" ${S.visible.has(id) ? 'checked' : ''}/><span class="sw ${point ? 'pt' : ''}" style="border-color:${color};background:${color}33"></span>${label}<span class="n">${n}</span></label>`;
+  let html = '';
+  for (const g of GROUPS) {
+    const rows =
+      g === 'Movement'
+        ? row('walk', 'Walking reach 5 · 10 · 15 min', '#f08a1c', false, '') + row('pois', 'Transport & everyday places', '#141414', true, S.pois.length ? String(S.pois.length) : '') + row('labels', 'Street names', '#999', false, '')
+        : DATASETS.filter((d) => d.group === g).map((d) => row(d.id, d.label, d.color, d.kind === 'point', S.model ? String(counts.get(d.id) ?? 0) : '')).join('');
+    const ids = g === 'Movement' ? ['walk', 'pois', 'labels'] : DATASETS.filter((d) => d.group === g).map((d) => d.id);
+    const on = ids.filter((i) => S.visible.has(i)).length;
+    const open = S.openGroups.has(g);
+    html += `<div class="acc"><button data-g="${g}"><span>${g.toUpperCase()}${on ? `<span class="on-count">${on} ON</span>` : ''}</span><span class="pm">${open ? '−' : '+'}</span></button>${open ? `<div class="body">${rows}</div>` : ''}</div>`;
   }
-  html += `<div class="lyr-group">Movement</div>
-    <label class="lyr"><input type="checkbox" data-l="walk" ${S.visible.has('walk') ? 'checked' : ''}/><span class="sw" style="border-color:#141414;border-style:dotted"></span>Walking reach 5 · 10 · 15 min</label>
-    <label class="lyr"><input type="checkbox" data-l="pois" ${S.visible.has('pois') ? 'checked' : ''}/><span class="sw pt" style="border-color:#141414;background:#14141433"></span>Transport & everyday places<span class="n">${S.pois.length || ''}</span></label>
-    <div class="lyr-group">Base</div>
-    <label class="lyr"><input type="checkbox" data-l="labels" ${S.visible.has('labels') ? 'checked' : ''}/><span class="sw" style="border-color:#999"></span>Street names</label>`;
   $('#layers').innerHTML = html;
+  $('#layers').querySelectorAll<HTMLButtonElement>('[data-g]').forEach((b) =>
+    b.addEventListener('click', () => {
+      const g = b.dataset.g!;
+      S.openGroups.has(g) ? S.openGroups.delete(g) : S.openGroups.add(g);
+      renderLayerList();
+    }),
+  );
   $('#layers').querySelectorAll<HTMLInputElement>('input[data-l]').forEach((cb) =>
     cb.addEventListener('change', () => {
       cb.checked ? S.visible.add(cb.dataset.l!) : S.visible.delete(cb.dataset.l!);
       applyVisibility();
+      setModelColours();
+      renderLayerList();
+      renderLegend();
     }),
   );
 }
 
 function applyVisibility() {
   const vis = (id: string, on: boolean) => map.getLayer(id) && map.setLayoutProperty(id, 'visibility', on ? 'visible' : 'none');
+  const atlas = S.view === 'atlas';
+  const flat = S.view === 'plan'; // point markers read in plan; in 3D the tinted buildings carry it
   for (const d of DATASETS) {
-    const on = S.visible.has(d.id);
+    const on = !atlas && S.visible.has(d.id);
     vis(`ds-${d.id}-f`, on);
     vis(`ds-${d.id}-l`, on);
   }
-  const flat = S.view === 'plan'; // point markers read in plan; in 3D the tinted buildings carry it
   vis('ds-listed', flat && S.visible.has('listed-building'));
   vis('ds-brownfield', flat && S.visible.has('brownfield-land'));
-  vis('walk', S.visible.has('walk'));
+  vis('walk', !atlas && S.visible.has('walk'));
   vis('pois', flat && S.visible.has('pois'));
-  vis('pois-label', S.visible.has('pois'));
-  for (const l of map.getStyle()?.layers ?? []) if (l.type === 'symbol' && /road-label|road-number|road-exit|street/.test(l.id)) vis(l.id, S.visible.has('labels'));
+  vis('pois-label', flat && S.visible.has('pois'));
+  for (const id of ['red-fill', 'red-line', 'study-line', 'massing-3d', 'selected-line']) vis(id, !atlas);
+  vis('atlas-labels', atlas);
+  for (const l of map.getStyle()?.layers ?? []) if (l.type === 'symbol' && /road-label|road-number|road-exit|street/.test(l.id)) vis(l.id, !atlas && S.visible.has('labels'));
 }
 
-// ---------------------------------------------------------------- summary
+// ---------------------------------------------------------------- summary (left) + legend (right)
 function renderSummary() {
   const m = S.model!;
   const inStudy = m.buildings.filter((b) => b.inStudy);
-  const onSite = inStudy.filter((b) => b.inSite);
-  const tallest = inStudy.reduce<Bldg | null>((t, b) => (b.heightKnown && (!t || b.h > t.h) ? b : t), null);
+  const known = inStudy.filter((b) => b.heightKnown);
+  const tallest = known.reduce<Bldg | null>((t, b) => (!t || b.h > t.h ? b : t), null);
   const listed = inStudy.reduce((n, b) => n + b.listed.length, 0);
   const onRed = S.red ? S.designations.features.filter((f) => f.geometry && safe(() => turf.booleanIntersects(f as any, S.red!), false)) : [];
   const c = turf.centroid(S.red ?? S.study!).geometry.coordinates;
-  const near = (cat: string) =>
-    S.pois.filter((p) => p.cat === cat).map((p) => ({ p, d: turf.distance(c, [p.lon, p.lat], { units: 'meters' }) })).sort((a, b) => a.d - b.d);
+  const near = (cat: string) => S.pois.filter((p) => p.cat === cat).map((p) => ({ p, d: turf.distance(c, [p.lon, p.lat], { units: 'meters' }) })).sort((a, b) => a.d - b.d);
   const rail = near('rail')[0];
   const buses = near('bus').filter((x) => x.d <= 400).length;
   const colorOf = (id: string) => DATASETS.find((d) => d.id === id)?.color ?? '#999';
+  const ha = turf.area(S.study!) / 10000;
 
-  $('#summary').innerHTML = `
-    <div class="ref">SITE</div>
-    <h1>${esc(S.place || 'The site')}</h1>
-    <p class="muted">${esc(S.lpa ?? '')}</p>
-    <h2>Red line and study area</h2>
-    <dl class="kv">
-      ${S.red ? `<dt>Red line</dt><dd>${fmtArea(turf.area(S.red))}</dd>` : ''}
-      <dt>Study area</dt><dd>${fmtArea(turf.area(S.study!))} · ${S.studyMode === 'buffer' ? `${S.bufferM} m around` : S.studyMode === 'walk' ? `${S.walkMin} min walk` : 'drawn'}</dd>
-      <dt>Buildings</dt><dd>${inStudy.length} in the study area, ${onSite.length} on the site</dd>
-      ${tallest ? `<dt>Tallest</dt><dd>${tallest.ref}, ${tallest.h.toFixed(0)} m</dd>` : ''}
-      <dt>Listed</dt><dd>${listed} listed building entries</dd>
-    </dl>
-    <h2>On the red line</h2>
+  $('#area').hidden = false;
+  $('#area').innerHTML = `
+    <h3>THE AREA${S.place ? ` · ${esc(S.place.toUpperCase())}` : ''}</h3>
+    <p class="big"><b>${ha < 10 ? ha.toFixed(1) : Math.round(ha)} ha</b> · <b>${inStudy.length}</b> buildings${tallest ? `, the tallest about <b>${Math.round(tallest.h)} m</b>` : ''}</p>
+    <p class="muted">${known.length} heights recorded, the rest estimated at 6 m. ${listed} listed building entries.${S.lpa ? ` ${esc(S.lpa)}.` : ''}</p>
+    <p><button class="link strong" id="drawAnother">DRAW ANOTHER AREA</button></p>
+    <h4>ON THE RED LINE</h4>
     ${onRed.length ? onRed.map((f) => `<div class="desig"><span class="sw" style="background:${colorOf(f.properties?.dataset)}"></span><a href="${entityUrl(f)}" target="_blank">${esc(describe(f))}</a></div>`).join('') : `<p class="muted">${S.red ? 'No designations touch the red line.' : 'No red line drawn.'}</p>`}
-    <h2>Getting about</h2>
-    ${rail ? `<p>Nearest station: <b>${esc(rail.p.name)}</b>, ${fmtDist(rail.d)} (${rail.p.kind})</p>` : '<p class="muted">No station within 1.2 km.</p>'}
-    <p>${buses} bus stops within 400 m</p>
-    <p class="muted" style="margin-top:14px">Click any building to read it. Use the views above to move between plan, 3D, axonometric and eye level; the selection stays linked.</p>`;
+    <h4>GETTING ABOUT</h4>
+    ${rail ? `<p>Nearest station: <b>${esc(rail.p.name)}</b>, ${fmtDist(rail.d)}</p>` : '<p class="muted">No station within 1.2 km.</p>'}
+    <p>${buses} bus stops within 400 m</p>`;
+  $('#drawAnother').onclick = () => resetAll(false);
+}
+
+function renderLegend() {
+  const m = S.model;
+  const n = m ? m.buildings.filter((b) => b.inStudy).length : 0;
+  const plan = S.view === 'plan';
+  const sw = (bg: string, extra = '') => `<span class="sw" style="background:${bg};${extra}"></span>`;
+  $('#legend').innerHTML = `
+    <div class="lg">${m ? `<b>${n}</b>&nbsp;in the study area` : '<span class="muted">Analyse the site to read the buildings</span>'}</div>
+    <div class="lg">${sw(plan ? '#232323' : '#fff', plan ? '' : 'border:1px solid #888')}Building</div>
+    ${S.visible.has('listed-building') && m ? `<div class="lg">${sw(plan ? '#5d3d7d' : '#c9b2de')}Listed building</div>` : ''}
+    ${S.red ? `<div class="lg">${sw('transparent', 'border:2.5px solid #d7262e')}Red line</div>` : ''}
+    ${S.study ? `<div class="lg">${sw('transparent', 'border:1.5px dashed #141414')}Study area</div>` : ''}
+    ${S.selected ? `<div class="lg">${sw('#2433e0')}Selected: ${S.selected.ref}</div>` : ''}`;
 }
 
 // ---------------------------------------------------------------- selection + leader line
@@ -493,16 +609,20 @@ map.on('click', (e) => {
 
 let osmSeq = 0;
 function select(b: Bldg | null) {
-  if (S.selected) map.setFeatureState({ source: 'model', id: S.selected.idx }, { selected: false });
+  if (S.selected && map.getSource('model')) map.setFeatureState({ source: 'model', id: S.selected.idx }, { selected: false });
   S.selected = b;
   (map.getSource('selected') as mapboxgl.GeoJSONSource)?.setData(b ? b.feature : empty);
-  $('#summary').hidden = !!b;
   $('#card').hidden = !b;
-  if (!b) return void drawLeader();
+  if (!b) {
+    $('#card').innerHTML = '';
+    renderLegend();
+    return void drawLeader();
+  }
   map.setFeatureState({ source: 'model', id: b.idx }, { selected: true });
   renderCard(b, null);
+  renderLegend();
   const seq = ++osmSeq;
-  fetchBuildingAt(b.ll[0], b.ll[1]).then((o) => seq === osmSeq && renderCard(b, o?.tags ?? {}));
+  fetchBuildingAt(b.ll[0], b.ll[1]).then((o) => seq === osmSeq && S.selected === b && renderCard(b, o?.tags ?? {}));
   drawLeader();
 }
 
@@ -517,7 +637,7 @@ function renderCard(b: Bldg, tags: Record<string, string> | null) {
     <div class="ref">${b.ref}${b.inSite ? ' · ON THE SITE' : b.inStudy ? '' : ' · CONTEXT'}</div>
     <h1>${esc(name || use)}</h1>
     <p class="muted">${name ? esc(use) : ''}${tags?.['addr:street'] ? ` · ${esc([tags['addr:housenumber'], tags['addr:street']].filter(Boolean).join(' '))}` : ''}</p>
-    <h2>Identity and form</h2>
+    <h4>IDENTITY AND FORM</h4>
     <dl class="kv">
       <dt>Height</dt><dd>${b.heightKnown ? `${b.h.toFixed(1)} m` : '<span class="muted">not recorded (6 m drawn)</span>'}</dd>
       ${tags?.['building:levels'] ? `<dt>Storeys</dt><dd>${esc(tags['building:levels'])}</dd>` : ''}
@@ -525,16 +645,16 @@ function renderCard(b: Bldg, tags: Record<string, string> | null) {
       <dt>Date</dt><dd>${esc(tags?.start_date ?? 'not recorded')}</dd>
       <dt>To red line</dt><dd>${S.red ? (b.inSite ? '<b class="red">on the site</b>' : fmtDist(Math.max(0, turf.pointToPolygonDistance(b.ll, S.red as any, { units: 'meters' })))) : '—'}</dd>
     </dl>
-    <h2>Protection and planning</h2>
+    <h4>PROTECTION AND PLANNING</h4>
     ${b.listed.map((l) => `<div class="desig"><span class="sw" style="background:#7B3FA0"></span><a href="${entityUrl(l)}" target="_blank">Listed: ${esc(describe(l))}</a></div>`).join('')}
     ${b.designations.map((d) => `<div class="desig"><span class="sw" style="background:${colorOf(d.properties?.dataset)}"></span><a href="${entityUrl(d)}" target="_blank">${esc(describe(d))}</a></div>`).join('')}
     ${!b.listed.length && !b.designations.length ? '<p class="muted">No designations recorded.</p>' : ''}
     <div class="nav">
-      <button class="primary" id="openPassport" style="width:100%">Building passport</button>
-      <button id="prevB" ${i <= 0 ? 'disabled' : ''}>‹ Prev</button>
-      <button id="nextB" ${i < 0 || i >= study.length - 1 ? 'disabled' : ''}>Next ›</button>
-      <button id="eyeB">Eye level</button>
-      <button id="closeB">Close</button>
+      <button class="solid" id="openPassport">BUILDING PASSPORT</button>
+      <button class="ghost" id="prevB" ${i <= 0 ? 'disabled' : ''}>‹ PREV</button>
+      <button class="ghost" id="nextB" ${i < 0 || i >= study.length - 1 ? 'disabled' : ''}>NEXT ›</button>
+      <button class="ghost" id="eyeB">EYE LEVEL</button>
+      <button class="ghost" id="closeB">CLOSE</button>
     </div>`;
   $('#openPassport').onclick = () => openPassport(b, { model: S.model!, pois: S.pois, token: TOKEN, place: S.place, lpa: S.lpa }, $('#passport'));
   $('#prevB').onclick = () => (select(study[i - 1]), ensureVisible(study[i - 1]));
@@ -544,10 +664,18 @@ function renderCard(b: Bldg, tags: Record<string, string> | null) {
   drawLeader();
 }
 
+/** Where a building currently is on the map: its real place, or its slot in the atlas. */
+function displayLL(b: Bldg): [number, number] {
+  const o = S.atlas?.offsets.get(b.idx);
+  if (!o || S.atlasT <= 0 || !S.model) return b.ll;
+  const f = atlasFactor(b.idx, S.atlasT);
+  return [b.ll[0] + (o[0] * f) / S.model.frame.kx, b.ll[1] + (o[1] * f) / S.model.frame.ky];
+}
+
 function ensureVisible(b: Bldg) {
-  const p = map.project(b.ll);
+  const p = map.project(displayLL(b));
   const c = map.getCanvas();
-  if (p.x < 40 || p.y < 40 || p.x > c.clientWidth - 40 || p.y > c.clientHeight - 40) map.easeTo({ center: b.ll, duration: 500 });
+  if (p.x < 40 || p.y < 40 || p.x > c.clientWidth - 40 || p.y > c.clientHeight - 40) map.easeTo({ center: displayLL(b), duration: 500 });
 }
 
 /** The atlas leader: from the selected building on the map to its card, redrawn every frame. */
@@ -557,12 +685,12 @@ function drawLeader() {
   const anchor = document.getElementById('anchor');
   if (!b || !anchor || $('#card').hidden) return void (svg.innerHTML = '');
   const mr = $('#map').getBoundingClientRect();
-  const pt = projectAt(b.ll, S.view === 'plan' ? 0 : b.h * 0.6);
+  const pt = projectAt(displayLL(b), S.view === 'plan' ? 0 : b.h * 0.6);
   const x0 = mr.left + pt.x, y0 = mr.top + pt.y;
   const ar = anchor.getBoundingClientRect();
-  const x1 = ar.left, y1 = Math.max(ar.top, $('#info').getBoundingClientRect().top + 10);
-  const inside = pt.x >= 0 && pt.y >= 0 && pt.x <= mr.width && pt.y <= mr.height;
-  if (!inside) return void (svg.innerHTML = '');
+  const ir = $('#info').getBoundingClientRect();
+  const x1 = ar.left, y1 = Math.min(Math.max(ar.top, ir.top + 10), ir.bottom - 10);
+  if (pt.x < 0 || pt.y < 0 || pt.x > mr.width || pt.y > mr.height) return void (svg.innerHTML = '');
   const mx = x0 + (x1 - x0) * 0.55;
   svg.innerHTML = `<path d="M${x0} ${y0} C ${mx} ${y0}, ${mx} ${y1}, ${x1} ${y1}" fill="none" stroke="#2433e0" stroke-width="1.5"/>
     <circle cx="${x0}" cy="${y0}" r="6" fill="none" stroke="#2433e0" stroke-width="2"/><circle cx="${x0}" cy="${y0}" r="2" fill="#2433e0"/>
@@ -573,7 +701,6 @@ function drawLeader() {
 function projectAt(ll: [number, number], h: number) {
   const base = map.project(ll);
   if (h <= 0 || map.getPitch() < 1) return base;
-  // Mapbox has no public project-with-altitude, so use the camera matrix directly.
   try {
     const tr: any = (map as any).transform;
     const mc = mapboxgl.MercatorCoordinate.fromLngLat(ll, h);
@@ -592,29 +719,117 @@ map.on('render', drawLeader);
 window.addEventListener('resize', drawLeader);
 $('#info').addEventListener('scroll', drawLeader);
 
+// ---------------------------------------------------------------- animations
+let growRAF = 0;
+/** Buildings rise out of the ground, rippling outward from the site. */
+function animateGrow(ms = 1600) {
+  cancelAnimationFrame(growRAF);
+  if (!map.getLayer('model-3d')) return;
+  const t0 = performance.now();
+  const step = () => {
+    const T = Math.min(1, (performance.now() - t0) / ms);
+    map.setPaintProperty('model-3d', 'fill-extrusion-height', growExpr('h', T));
+    map.setPaintProperty('model-3d', 'fill-extrusion-base', growExpr('minH', T));
+    map.setPaintProperty('context-3d', 'fill-extrusion-height', ['*', ['get', 'height'], ease(T)]);
+    map.setPaintProperty('massing-3d', 'fill-extrusion-height', ['*', ['get', 'h'], ease(Math.max(0, T * 1.4 - 0.4))]);
+    if (T < 1) growRAF = requestAnimationFrame(step);
+    else {
+      map.setPaintProperty('model-3d', 'fill-extrusion-height', ['get', 'h']);
+      map.setPaintProperty('model-3d', 'fill-extrusion-base', ['get', 'minH']);
+      map.setPaintProperty('context-3d', 'fill-extrusion-height', ['get', 'height']);
+      map.setPaintProperty('massing-3d', 'fill-extrusion-height', ['get', 'h']);
+    }
+  };
+  step();
+}
+
+const atlasFactor = (idx: number, t: number) => ease(Math.min(1, Math.max(0, t * 1.5 - (S.atlas?.rank.get(idx) ?? 0) * 0.5)));
+
+function atlasFC(t: number): FeatureCollection {
+  const m = S.model!, A = S.atlas!;
+  return {
+    type: 'FeatureCollection',
+    features: S.modelFC.features.map((f) => {
+      const o = A.offsets.get(f.id as number);
+      if (!o || t <= 0) return f;
+      const k = atlasFactor(f.id as number, t);
+      return k ? translateFeature(f as PolyF, [o[0] * k, o[1] * k], m) : f;
+    }),
+  };
+}
+
+let atlasRAF = 0;
+/** Split the buildings out into the atlas grid (to=1) or put them back (to=0). */
+function animateAtlas(to: 0 | 1, ms = 1500): Promise<void> {
+  cancelAnimationFrame(atlasRAF);
+  const src = map.getSource('model') as mapboxgl.GeoJSONSource;
+  const from = S.atlasT;
+  if (!S.model || !S.atlas || from === to) return Promise.resolve();
+  (map.getSource('atlas-labels') as mapboxgl.GeoJSONSource).setData(empty);
+  const t0 = performance.now();
+  return new Promise((res) => {
+    const step = () => {
+      const k = Math.min(1, (performance.now() - t0) / ms);
+      S.atlasT = from + (to - from) * k;
+      src.setData(k < 1 ? atlasFC(S.atlasT) : to ? atlasFC(1) : S.modelFC);
+      if (k < 1) atlasRAF = requestAnimationFrame(step);
+      else {
+        if (to) (map.getSource('atlas-labels') as mapboxgl.GeoJSONSource).setData(atlasLabels());
+        res();
+      }
+    };
+    step();
+  });
+}
+
+function atlasLabels(): FeatureCollection {
+  const m = S.model!;
+  return { type: 'FeatureCollection', features: S.atlas!.labels.map((l) => ({ type: 'Feature', geometry: { type: 'Point', coordinates: m.frame.toLngLat(l.at) }, properties: { text: l.text } })) };
+}
+
+function atlasBounds(): [[number, number], [number, number]] {
+  const m = S.model!, B = S.atlas!.bounds;
+  return [m.frame.toLngLat([B.minX, B.minY]), m.frame.toLngLat([B.maxX, B.maxY])];
+}
+
 // ---------------------------------------------------------------- views
 document.querySelectorAll<HTMLButtonElement>('#views [data-view]').forEach((b) => b.addEventListener('click', () => setView(b.dataset.view as View)));
 $('#rotL').onclick = () => map.easeTo({ bearing: map.getBearing() - 45, duration: 600 });
 $('#rotR').onclick = () => map.easeTo({ bearing: map.getBearing() + 45, duration: 600 });
 
-function setView(v: View) {
+async function setView(v: View, opts: { quiet?: boolean } = {}) {
   const prev = S.view;
+  if (v === 'atlas' && !S.model) return toast('Analyse the site first: the atlas lays out every building in the study area.');
   S.view = v;
   document.querySelectorAll('#views [data-view]').forEach((x) => x.classList.toggle('on', (x as HTMLElement).dataset.view === v));
-  map.setCamera({ 'camera-projection': v === 'axo' || v === 'plan' ? 'orthographic' : 'perspective' });
-  const isolate = v === 'axo' && !!S.model;
+  map.setCamera({ 'camera-projection': v === 'axo' || v === 'plan' || v === 'atlas' ? 'orthographic' : 'perspective' });
+  const isolate = (v === 'axo' || v === 'atlas') && !!S.model;
   map.setFilter('model-3d', isolate ? ['==', ['get', 'inStudy'], true] : null);
   if (map.getLayer('building')) map.setLayoutProperty('building', 'visibility', isolate ? 'none' : 'visible');
-  map.setPaintProperty('mask', 'fill-opacity', isolate ? 0.94 : 0.6);
+  map.setPaintProperty('mask', 'fill-opacity', v === 'atlas' ? 1 : isolate ? 0.94 : 0.55);
+  (map.getSource('mask') as mapboxgl.GeoJSONSource)?.setData(v === 'atlas' ? maskOf(null) : S.study ? maskOf(S.study) : empty);
   if (!S.model) map.setLayoutProperty('context-3d', 'visibility', v === 'plan' ? 'none' : 'visible');
+  setModelColours();
   applyVisibility();
+  renderLegend();
+  if (opts.quiet) return;
+
+  if (prev === 'atlas' && v !== 'atlas') await animateAtlas(0, 1100);
+
   const target = (S.selected?.ll ?? (S.red || S.study ? turf.centroid((S.red ?? S.study)!).geometry.coordinates : map.getCenter().toArray())) as [number, number];
   const bearing = Math.abs(map.getBearing()) < 1 ? -30 : map.getBearing();
   if (v === 'plan') map.easeTo({ pitch: 0, bearing: 0, duration: 700 });
-  else if (v === '3d') map.easeTo({ pitch: 60, bearing, zoom: Math.max(map.getZoom(), 16), duration: 700 });
-  else if (v === 'axo') {
+  else if (v === '3d') {
+    map.easeTo({ pitch: 60, bearing, zoom: Math.max(map.getZoom(), 16), duration: 700 });
+    if (prev === 'plan' || prev === 'atlas') animateGrow();
+  } else if (v === 'axo') {
     if (S.study) map.fitBounds(turf.bbox(S.study) as any, { pitch: 55, bearing, padding: 50, duration: 700 });
     else map.easeTo({ pitch: 55, bearing, duration: 700 });
+    if (prev !== 'axo') animateGrow();
+  } else if (v === 'atlas') {
+    S.atlas ??= layoutAtlas(S.model!.buildings.filter((b) => b.inStudy));
+    map.fitBounds(atlasBounds(), { pitch: 50, bearing: 0, padding: 40, duration: 900 });
+    await animateAtlas(1);
   } else if (v === 'eye') {
     const { from, look } = eyePoint(target);
     // Mapbox caps pitch at 85°, so aim at the ground 16 m ahead (≈84°): near-horizontal, the way a person sees.
@@ -625,8 +840,17 @@ function setView(v: View) {
     cam.lookAtPoint(aim);
     map.setFreeCameraOptions(cam);
   }
-  if (prev === 'eye' && v !== 'eye') map.easeTo({ center: target, zoom: 16.5, duration: 700 });
+  if (prev === 'eye' && v !== 'eye' && v !== 'atlas' && v !== 'axo') map.easeTo({ center: target, zoom: 16.5, duration: 700 });
   setTimeout(drawLeader, 750);
+}
+
+let toastT = 0;
+function toast(msg: string) {
+  const el = $('#toast');
+  el.textContent = msg;
+  el.hidden = false;
+  clearTimeout(toastT);
+  toastT = window.setTimeout(() => (el.hidden = true), 3500);
 }
 
 /** Stand in a street at a comfortable distance from the facade (about twice the height), facing the building. */
@@ -689,23 +913,27 @@ function sunNow() {
   const alt = p.altitude;
   const az = p.azimuth;
   const toSun: XY = [Math.sin((az * Math.PI) / 180), Math.cos((az * Math.PI) / 180)]; // east, north
-  return { d, alt, az, toSun };
+  const times: any = (SunCalc as any).getTimes(d, c.lat, c.lng);
+  return { d, alt, az, toSun, sunset: times?.sunset as Date | null };
 }
 
+const hm = (d: Date) => d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
 function applySun() {
   const s = sunNow();
   const on = $<HTMLInputElement>('#sunOn').checked && s.alt > 0;
-  $('#sunStat').textContent = `${s.d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })} · sun ${s.alt > 0 ? `${s.alt.toFixed(0)}° up, from ${compass(s.az)}` : 'below the horizon'}`;
-  if (!map.isStyleLoaded()) return;
+  $('#sunClock').textContent = hm(s.d);
+  const shadow = s.alt > 0 ? 10 / Math.tan((s.alt * Math.PI) / 180) : 0;
+  $('#sunStat').textContent =
+    s.alt > 0
+      ? `Sun ${s.alt.toFixed(0)}° above the horizon, bearing ${s.az.toFixed(0)}° (${compass(s.az)}). A 10 m wall throws ${shadow > 500 ? 'a very long' : `${Math.round(shadow)} m of`} shadow.${s.sunset ? ` Sunset ${hm(s.sunset)}.` : ''}`
+      : `The sun is below the horizon.${s.sunset ? ` Sunset was ${hm(s.sunset)}.` : ''}`;
+  if (!map.getLayer('model-3d')) return;
   map.setLights([
     { id: 'ambient', type: 'ambient', properties: { color: '#ffffff', intensity: on ? 0.55 : 0.8 } },
-    {
-      id: 'sun', type: 'directional',
-      properties: { color: '#ffffff', intensity: on ? 0.55 : 0.3, direction: [s.az, Math.min(89, Math.max(5, 90 - s.alt))], 'cast-shadows': on, 'shadow-intensity': 0.55 },
-    },
+    { id: 'sun', type: 'directional', properties: { color: '#ffffff', intensity: on ? 0.55 : 0.3, direction: [s.az, Math.min(89, Math.max(5, 90 - s.alt))], 'cast-shadows': on, 'shadow-intensity': 0.55 } },
   ]);
 }
-const compass = (a: number) => ['north', 'north-east', 'east', 'south-east', 'south', 'south-west', 'west', 'north-west'][Math.round(a / 45) % 8];
+const compass = (a: number) => ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'][Math.round(a / 45) % 8];
 
 // ---------------------------------------------------------------- export
 function overlayPolys(): GroundPolys[] {
@@ -722,17 +950,14 @@ function overlayPolys(): GroundPolys[] {
   return out;
 }
 
+const lookFor = (b: Bldg) => (b === S.selected ? LOOK.selected : b.listed.length ? LOOK.listed : b.inSite ? LOOK.site : LOOK.context);
+
 function exportDrawing(kind: 'axo' | 'plan') {
   const m = S.model;
   if (!m) return;
   const mode = $<HTMLSelectElement>('#axoMode').value as 'ortho' | 'oblique';
   const s = sunNow();
-  const buildings: AxoBuilding[] = m.buildings
-    .filter((b) => b.cut)
-    .map((b) => ({
-      polys: b.cut!, z0: b.minH, z1: b.h, label: b.ref,
-      look: b === S.selected ? LOOK.selected : b.listed.length ? LOOK.listed : b.inSite ? LOOK.site : LOOK.context,
-    }));
+  const buildings: AxoBuilding[] = m.buildings.filter((b) => b.cut).map((b) => ({ polys: b.cut!, z0: b.minH, z1: b.h, label: b.ref, look: lookFor(b) }));
   if (S.massing > 0 && m.redPolys) buildings.push({ polys: m.redPolys, z0: 0, z1: S.massing, look: LOOK.massing, label: 'Proposed' });
   const pitch = kind === 'plan' ? 0 : S.view === 'axo' || S.view === '3d' ? map.getPitch() : 55;
   const svg = renderAxo(
@@ -750,14 +975,33 @@ function exportDrawing(kind: 'axo' | 'plan') {
   );
   showExport(svg, `${slug(S.place || 'site')}-${kind}`);
 }
+
+/** Every building in the study area at the same scale, laid out in reference order. */
+function exportAtlas() {
+  const m = S.model;
+  if (!m) return;
+  S.atlas ??= layoutAtlas(m.buildings.filter((b) => b.inStudy));
+  const A = S.atlas;
+  const buildings: AxoBuilding[] = m.buildings
+    .filter((b) => A.offsets.has(b.idx))
+    .map((b) => {
+      const [dx, dy] = A.offsets.get(b.idx)!;
+      const polys: LocalPoly[] = b.polys.map((pl) => pl.map((r) => r.map((q) => [q[0] + dx, q[1] + dy] as XY)));
+      return { polys, z0: b.minH, z1: b.h, label: b.ref, look: lookFor(b) };
+    });
+  const svg = renderAxo({ buildings }, { bearing: 0, mode: $<HTMLSelectElement>('#axoMode').value as 'ortho' | 'oblique', pitch: 50, width: 2000, background: '#ffffff', labels: true, scaleBar: true });
+  showExport(svg, `${slug(S.place || 'site')}-atlas`);
+}
+
 $('#expAxo').onclick = () => exportDrawing('axo');
 $('#expPlan').onclick = () => exportDrawing('plan');
+$('#expAtlas').onclick = exportAtlas;
 $('#expPng').onclick = () => map.getCanvas().toBlob((b) => b && download(b, `${slug(S.place || 'site')}-${S.view}.png`));
 
 function showExport(svg: string, name: string) {
   const host = $('#exportView');
   host.hidden = false;
-  host.innerHTML = `<div class="pp-toolbar"><span>${esc(name)}.svg</span><button data-a="svg">Download SVG</button><button data-a="png">Download PNG</button><button data-a="close">Close</button></div><div class="ex-body">${svg}</div>`;
+  host.innerHTML = `<div class="pp-toolbar"><span>${esc(name)}.svg</span><button data-a="svg">DOWNLOAD SVG</button><button data-a="png">DOWNLOAD PNG</button><button data-a="close">CLOSE</button></div><div class="ex-body">${svg}</div>`;
   host.querySelector<HTMLButtonElement>('[data-a=close]')!.onclick = () => (host.hidden = true);
   host.querySelector<HTMLButtonElement>('[data-a=svg]')!.onclick = () => download(new Blob([svg], { type: 'image/svg+xml' }), `${name}.svg`);
   host.querySelector<HTMLButtonElement>('[data-a=png]')!.onclick = () => {
@@ -795,7 +1039,8 @@ function safe<T>(fn: () => T, fb: T): T {
 const KEY = 'site-lab:last';
 function saveProject() {
   try {
-    localStorage.setItem(KEY, JSON.stringify({ red: S.red, place: S.place, mode: S.studyMode, bufferM: S.bufferM, walkMin: S.walkMin }));
+    if (!S.red) return;
+    localStorage.setItem(KEY, JSON.stringify({ red: S.red, place: S.place, bufferM: S.bufferM }));
   } catch { /* storage blocked */ }
 }
 let restored = false;
@@ -806,14 +1051,18 @@ function restoreProject() {
     const j = JSON.parse(localStorage.getItem(KEY) ?? 'null');
     if (!j?.red) return;
     S.place = j.place ?? '';
+    searchBox.value = S.place;
+    $('#clearSearch').hidden = !S.place;
     S.bufferM = j.bufferM ?? 200;
     $<HTMLInputElement>('#bufferM').value = String(S.bufferM);
-    $('#bufferLbl').textContent = `${S.bufferM} m`;
+    $('#bufferLbl').textContent = `${S.bufferM} m around the red line`;
     setRed(j.red);
     map.jumpTo({ center: turf.centroid(j.red).geometry.coordinates as [number, number], zoom: 16 });
   } catch { /* nothing saved */ }
 }
 
 renderLayerList();
+renderLegend();
+applySun();
 // Exposed for debugging in the console.
-(window as any).siteLab = { map, S, setView, select, analyse };
+(window as any).siteLab = { map, S, setView, select, analyse, resetAll };

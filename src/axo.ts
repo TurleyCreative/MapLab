@@ -92,7 +92,7 @@ export function renderAxo(scene: Scene, o: AxoOpts): string {
   const nss = 'vector-effect="non-scaling-stroke"';
 
   const out: string[] = [];
-  out.push(`<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" font-family="Inter, Helvetica, Arial, sans-serif">`);
+  out.push(`<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" font-family="'Plus Jakarta Sans', Helvetica, Arial, sans-serif">`);
   if (o.background) out.push(`<rect width="${W}" height="${H}" fill="${o.background}"/>`);
   if (scene.clip) out.push(`<defs><clipPath id="${cid}"><path d="${scene.clip.map((pl) => polyPath(pl, 0)).join('')}" clip-rule="evenodd"/></clipPath></defs>`);
   out.push(`<g transform="matrix(${f1(s)} 0 0 ${f1(s)} ${f1(tx)} ${f1(ty)})" stroke-linejoin="round">`);

@@ -136,6 +136,8 @@ function safe<T>(fn: () => T, fb: T): T {
 }
 
 export function modelGeoJSON(m: SiteModel): FeatureCollection {
+  // d: 0 at the site, 1 at the edge of the study area, for the outward "grow" animation.
+  const maxD = Math.max(1, ...m.buildings.filter((b) => b.inStudy).map((b) => Math.hypot(...b.centroid)));
   return {
     type: 'FeatureCollection',
     features: m.buildings.map((b) => ({
@@ -149,6 +151,7 @@ export function modelGeoJSON(m: SiteModel): FeatureCollection {
         inStudy: b.inStudy,
         inSite: b.inSite,
         listed: b.listed.length > 0,
+        d: b.inStudy ? Math.min(1, Math.hypot(...b.centroid) / maxD) : 1,
       },
     })),
   };
