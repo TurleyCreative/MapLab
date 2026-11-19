@@ -141,7 +141,7 @@ function addLayers() {
   });
   const font = ['DIN Pro Medium', 'Arial Unicode MS Regular'];
   map.addLayer({ id: 'pois-label', type: 'symbol', source: 'pois', filter: ['==', ['get', 'cat'], 'rail'], layout: { 'text-field': ['get', 'name'], 'text-size': 11, 'text-offset': [0, 1.1], 'text-anchor': 'top', 'text-font': font }, paint: { 'text-color': '#141414', 'text-halo-color': '#fff', 'text-halo-width': 1.5 } });
-  map.addLayer({ id: 'atlas-labels', type: 'symbol', source: 'atlas-labels', layout: { 'text-field': ['get', 'text'], 'text-size': 10.5, 'text-anchor': 'top-left', 'text-font': font, 'text-letter-spacing': 0.06, 'text-allow-overlap': true }, paint: { 'text-color': '#141414' } });
+  map.addLayer({ id: 'atlas-labels', type: 'symbol', source: 'atlas-labels', layout: { 'text-field': ['get', 'text'], 'text-size': 10.5, 'text-anchor': 'top', 'text-font': font, 'text-letter-spacing': 0.06, 'text-allow-overlap': true }, paint: { 'text-color': '#141414' } });
 
   unlitFlatLayers();
   setModelColours();
@@ -175,14 +175,15 @@ map.on('style.load', () => {
 function setModelColours() {
   if (!map.getLayer('model-3d')) return;
   const sel = ['boolean', ['feature-state', 'selected'], false], hov = ['boolean', ['feature-state', 'hover'], false];
-  const plan = S.view === 'plan';
+  const plan = S.view === 'plan' || S.view === 'atlas';
+  const atlas = S.view === 'atlas';
   const listedOn = S.visible.has('listed-building');
   map.setPaintProperty('model-3d', 'fill-extrusion-color', [
     'case',
     sel, '#2433e0',
     hov, plan ? '#4d58f0' : '#9aa3ff',
     ['all', ['get', 'listed'], listedOn], plan ? '#5d3d7d' : '#c9b2de',
-    ['get', 'inSite'], plan ? '#1a1a1a' : '#f1b2b5',
+    ['get', 'inSite'], atlas ? '#d7262e' : plan ? '#1a1a1a' : '#f1b2b5',
     ['get', 'inStudy'], plan ? '#232323' : '#ffffff',
     plan ? '#c9c9c9' : '#e3e2dd',
   ] as any);
@@ -503,7 +504,7 @@ function renderLayerList() {
     const ids = g === 'Movement' ? ['walk', 'pois', 'labels'] : DATASETS.filter((d) => d.group === g).map((d) => d.id);
     const on = ids.filter((i) => S.visible.has(i)).length;
     const open = S.openGroups.has(g);
-    html += `<div class="acc"><button data-g="${g}"><span>${g.toUpperCase()}${on ? `<span class="on-count">${on} ON</span>` : ''}</span><span class="pm">${open ? '−' : '+'}</span></button>${open ? `<div class="body">${rows}</div>` : ''}</div>`;
+    html += `<div class="acc"><button data-g="${g}"><span>${g}${on ? `<span class="on-count">${on} on</span>` : ''}</span><span class="pm">${open ? '−' : '+'}</span></button>${open ? `<div class="body">${rows}</div>` : ''}</div>`;
   }
   $('#layers').innerHTML = html;
   $('#layers').querySelectorAll<HTMLButtonElement>('[data-g]').forEach((b) =>
@@ -560,13 +561,13 @@ function renderSummary() {
 
   $('#area').hidden = false;
   $('#area').innerHTML = `
-    <h3>THE AREA${S.place ? ` · ${esc(S.place.toUpperCase())}` : ''}</h3>
+    <h3>The area${S.place ? ` · ${esc(S.place)}` : ''}</h3>
     <p class="big"><b>${ha < 10 ? ha.toFixed(1) : Math.round(ha)} ha</b> · <b>${inStudy.length}</b> buildings${tallest ? `, the tallest about <b>${Math.round(tallest.h)} m</b>` : ''}</p>
     <p class="muted">${known.length} heights recorded, the rest estimated at 6 m. ${listed} listed building entries.${S.lpa ? ` ${esc(S.lpa)}.` : ''}</p>
-    <p><button class="link strong" id="drawAnother">DRAW ANOTHER AREA</button></p>
-    <h4>ON THE RED LINE</h4>
+    <p><button class="link strong" id="drawAnother">Draw another area</button></p>
+    <h4>On the red line</h4>
     ${onRed.length ? onRed.map((f) => `<div class="desig"><span class="sw" style="background:${colorOf(f.properties?.dataset)}"></span><a href="${entityUrl(f)}" target="_blank">${esc(describe(f))}</a></div>`).join('') : `<p class="muted">${S.red ? 'No designations touch the red line.' : 'No red line drawn.'}</p>`}
-    <h4>GETTING ABOUT</h4>
+    <h4>Getting about</h4>
     ${rail ? `<p>Nearest station: <b>${esc(rail.p.name)}</b>, ${fmtDist(rail.d)}</p>` : '<p class="muted">No station within 1.2 km.</p>'}
     <p>${buses} bus stops within 400 m</p>`;
   $('#drawAnother').onclick = () => resetAll(false);
@@ -575,13 +576,13 @@ function renderSummary() {
 function renderLegend() {
   const m = S.model;
   const n = m ? m.buildings.filter((b) => b.inStudy).length : 0;
-  const plan = S.view === 'plan';
+  const plan = S.view === 'plan' || S.view === 'atlas';
   const sw = (bg: string, extra = '') => `<span class="sw" style="background:${bg};${extra}"></span>`;
   $('#legend').innerHTML = `
     <div class="lg">${m ? `<b>${n}</b>&nbsp;in the study area` : '<span class="muted">Analyse the site to read the buildings</span>'}</div>
     <div class="lg">${sw(plan ? '#232323' : '#fff', plan ? '' : 'border:1px solid #888')}Building</div>
     ${S.visible.has('listed-building') && m ? `<div class="lg">${sw(plan ? '#5d3d7d' : '#c9b2de')}Listed building</div>` : ''}
-    ${S.red ? `<div class="lg">${sw('transparent', 'border:2.5px solid #d7262e')}Red line</div>` : ''}
+    ${S.red ? (S.view === 'atlas' ? `<div class="lg">${sw('#d7262e')}On the site</div>` : `<div class="lg">${sw('transparent', 'border:2.5px solid #d7262e')}Red line</div>`) : ''}
     ${S.study ? `<div class="lg">${sw('transparent', 'border:1.5px dashed #141414')}Study area</div>` : ''}
     ${S.selected ? `<div class="lg">${sw('#2433e0')}Selected: ${S.selected.ref}</div>` : ''}`;
 }
@@ -634,10 +635,10 @@ function renderCard(b: Bldg, tags: Record<string, string> | null) {
   const i = study.indexOf(b);
   $('#card').innerHTML = `
     <span class="anchor" id="anchor"></span>
-    <div class="ref">${b.ref}${b.inSite ? ' · ON THE SITE' : b.inStudy ? '' : ' · CONTEXT'}</div>
+    <div class="ref">${b.ref}${b.inSite ? ' · on the site' : b.inStudy ? '' : ' · context'}</div>
     <h1>${esc(name || use)}</h1>
     <p class="muted">${name ? esc(use) : ''}${tags?.['addr:street'] ? ` · ${esc([tags['addr:housenumber'], tags['addr:street']].filter(Boolean).join(' '))}` : ''}</p>
-    <h4>IDENTITY AND FORM</h4>
+    <h4>Identity and form</h4>
     <dl class="kv">
       <dt>Height</dt><dd>${b.heightKnown ? `${b.h.toFixed(1)} m` : '<span class="muted">not recorded (6 m drawn)</span>'}</dd>
       ${tags?.['building:levels'] ? `<dt>Storeys</dt><dd>${esc(tags['building:levels'])}</dd>` : ''}
@@ -645,16 +646,16 @@ function renderCard(b: Bldg, tags: Record<string, string> | null) {
       <dt>Date</dt><dd>${esc(tags?.start_date ?? 'not recorded')}</dd>
       <dt>To red line</dt><dd>${S.red ? (b.inSite ? '<b class="red">on the site</b>' : fmtDist(Math.max(0, turf.pointToPolygonDistance(b.ll, S.red as any, { units: 'meters' })))) : '—'}</dd>
     </dl>
-    <h4>PROTECTION AND PLANNING</h4>
+    <h4>Protection and planning</h4>
     ${b.listed.map((l) => `<div class="desig"><span class="sw" style="background:#7B3FA0"></span><a href="${entityUrl(l)}" target="_blank">Listed: ${esc(describe(l))}</a></div>`).join('')}
     ${b.designations.map((d) => `<div class="desig"><span class="sw" style="background:${colorOf(d.properties?.dataset)}"></span><a href="${entityUrl(d)}" target="_blank">${esc(describe(d))}</a></div>`).join('')}
     ${!b.listed.length && !b.designations.length ? '<p class="muted">No designations recorded.</p>' : ''}
     <div class="nav">
-      <button class="solid" id="openPassport">BUILDING PASSPORT</button>
-      <button class="ghost" id="prevB" ${i <= 0 ? 'disabled' : ''}>‹ PREV</button>
-      <button class="ghost" id="nextB" ${i < 0 || i >= study.length - 1 ? 'disabled' : ''}>NEXT ›</button>
-      <button class="ghost" id="eyeB">EYE LEVEL</button>
-      <button class="ghost" id="closeB">CLOSE</button>
+      <button class="solid" id="openPassport">Building passport</button>
+      <button class="ghost" id="prevB" ${i <= 0 ? 'disabled' : ''}>‹ Prev</button>
+      <button class="ghost" id="nextB" ${i < 0 || i >= study.length - 1 ? 'disabled' : ''}>Next ›</button>
+      <button class="ghost" id="eyeB">Eye level</button>
+      <button class="ghost" id="closeB">Close</button>
     </div>`;
   $('#openPassport').onclick = () => openPassport(b, { model: S.model!, pois: S.pois, token: TOKEN, place: S.place, lpa: S.lpa }, $('#passport'));
   $('#prevB').onclick = () => (select(study[i - 1]), ensureVisible(study[i - 1]));
@@ -812,6 +813,7 @@ async function setView(v: View, opts: { quiet?: boolean } = {}) {
   setModelColours();
   applyVisibility();
   renderLegend();
+  applySun();
   if (opts.quiet) return;
 
   if (prev === 'atlas' && v !== 'atlas') await animateAtlas(0, 1100);
@@ -827,8 +829,10 @@ async function setView(v: View, opts: { quiet?: boolean } = {}) {
     else map.easeTo({ pitch: 55, bearing, duration: 700 });
     if (prev !== 'axo') animateGrow();
   } else if (v === 'atlas') {
-    S.atlas ??= layoutAtlas(S.model!.buildings.filter((b) => b.inStudy));
-    map.fitBounds(atlasBounds(), { pitch: 50, bearing: 0, padding: 40, duration: 900 });
+    const c = map.getCanvas();
+    S.atlas ??= layoutAtlas(S.model!.buildings.filter((b) => b.inStudy), c.clientWidth / c.clientHeight);
+    // Opens top-down so the grid reads as a sheet; tilt with right-drag or the compass to see it in 3D.
+    map.fitBounds(atlasBounds(), { pitch: 0, bearing: 0, padding: 36, duration: 900 });
     await animateAtlas(1);
   } else if (v === 'eye') {
     const { from, look } = eyePoint(target);
@@ -920,7 +924,8 @@ function sunNow() {
 const hm = (d: Date) => d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
 function applySun() {
   const s = sunNow();
-  const on = $<HTMLInputElement>('#sunOn').checked && s.alt > 0;
+  // No cast shadows in the atlas: it is a sheet of objects, not a place.
+  const on = $<HTMLInputElement>('#sunOn').checked && s.alt > 0 && S.view !== 'atlas';
   $('#sunClock').textContent = hm(s.d);
   const shadow = s.alt > 0 ? 10 / Math.tan((s.alt * Math.PI) / 180) : 0;
   $('#sunStat').textContent =
@@ -980,7 +985,8 @@ function exportDrawing(kind: 'axo' | 'plan') {
 function exportAtlas() {
   const m = S.model;
   if (!m) return;
-  S.atlas ??= layoutAtlas(m.buildings.filter((b) => b.inStudy));
+  const c = map.getCanvas();
+  S.atlas ??= layoutAtlas(m.buildings.filter((b) => b.inStudy), c.clientWidth / c.clientHeight);
   const A = S.atlas;
   const buildings: AxoBuilding[] = m.buildings
     .filter((b) => A.offsets.has(b.idx))
@@ -1001,7 +1007,7 @@ $('#expPng').onclick = () => map.getCanvas().toBlob((b) => b && download(b, `${s
 function showExport(svg: string, name: string) {
   const host = $('#exportView');
   host.hidden = false;
-  host.innerHTML = `<div class="pp-toolbar"><span>${esc(name)}.svg</span><button data-a="svg">DOWNLOAD SVG</button><button data-a="png">DOWNLOAD PNG</button><button data-a="close">CLOSE</button></div><div class="ex-body">${svg}</div>`;
+  host.innerHTML = `<div class="pp-toolbar"><span>${esc(name)}.svg</span><button data-a="svg">Download SVG</button><button data-a="png">Download PNG</button><button data-a="close">Close</button></div><div class="ex-body">${svg}</div>`;
   host.querySelector<HTMLButtonElement>('[data-a=close]')!.onclick = () => (host.hidden = true);
   host.querySelector<HTMLButtonElement>('[data-a=svg]')!.onclick = () => download(new Blob([svg], { type: 'image/svg+xml' }), `${name}.svg`);
   host.querySelector<HTMLButtonElement>('[data-a=png]')!.onclick = () => {

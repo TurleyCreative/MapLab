@@ -10,43 +10,57 @@ export interface AtlasLayout {
   bounds: { minX: number; minY: number; maxX: number; maxY: number };
 }
 
-export function layoutAtlas(bs: Bldg[], gap = 14): AtlasLayout {
+/**
+ * A table-style grid: buildings in reference order, read left to right, top to bottom.
+ * Every column is as wide as its widest building and every row as tall as its tallest, so rows and
+ * columns line up, each building sits centred in its cell, and its reference sits underneath.
+ * `aspect` is the width/height of the screen, so the sheet fills the view.
+ */
+export function layoutAtlas(bs: Bldg[], aspect = 1.2, gap = 20): AtlasLayout {
   const items = bs
     .slice()
     .sort((a, b) => a.ref.localeCompare(b.ref))
     .map((b) => {
       const xs = b.polys.flatMap((p) => p[0].map((q) => q[0]));
       const ys = b.polys.flatMap((p) => p[0].map((q) => q[1]));
-      const minX = Math.min(...xs), minY = Math.min(...ys);
-      // Slots are at least 22 m wide so every reference has room under its building.
-      return { b, minX, minY, w: Math.max(...xs) - minX, slot: Math.max(22, Math.max(...xs) - minX), h: Math.max(...ys) - minY };
+      const minX = Math.min(...xs), maxX = Math.max(...xs), minY = Math.min(...ys), maxY = Math.max(...ys);
+      return { b, cx: (minX + maxX) / 2, cy: (minY + maxY) / 2, w: Math.max(16, maxX - minX), h: Math.max(12, maxY - minY) };
     });
-  const label = 10; // room under each building for its reference
-  const total = items.reduce((s, it) => s + (it.slot + gap) * (it.h + gap + label), 0);
-  const rowW = Math.max(Math.sqrt(total) * 1.3, ...items.map((it) => it.slot + gap));
+  const n = items.length;
+  const label = 14; // band under each row for the references
+
+  const measure = (cols: number) => {
+    const rows = Math.ceil(n / cols);
+    const colW = Array(cols).fill(0), rowH = Array(rows).fill(0);
+    items.forEach((it, i) => {
+      colW[i % cols] = Math.max(colW[i % cols], it.w);
+      rowH[Math.floor(i / cols)] = Math.max(rowH[Math.floor(i / cols)], it.h);
+    });
+    const W = colW.reduce((s, w) => s + w + gap, -gap);
+    const H = rowH.reduce((s, h) => s + h + label + gap, -gap);
+    return { cols, rows, colW, rowH, W, H };
+  };
+  // Pick the column count whose sheet shape best matches the screen.
+  let best = measure(1);
+  for (let c = 2; c <= n; c++) {
+    const m = measure(c);
+    if (Math.abs(Math.log(m.W / m.H / aspect)) < Math.abs(Math.log(best.W / best.H / aspect))) best = m;
+  }
+  const { cols, colW, rowH, W, H } = best;
+  const colX: number[] = [], rowY: number[] = [];
+  colW.reduce((x, w, i) => ((colX[i] = x), x + w + gap), -W / 2);
+  rowH.reduce((y, h, i) => ((rowY[i] = y), y - h - label - gap), H / 2);
 
   const offsets = new Map<number, XY>(), rank = new Map<number, number>();
   const labels: AtlasLayout['labels'] = [];
-  let x = 0, y = 0, rowH = 0;
   items.forEach((it, i) => {
-    if (x > 0 && x + it.slot > rowW) {
-      x = 0;
-      y -= rowH + gap + label;
-      rowH = 0;
-    }
-    // Building sits in [x, x+w] × [y-h, y]; the label goes just below it.
-    offsets.set(it.b.idx, [x - it.minX, y - it.h - it.minY]);
-    labels.push({ idx: it.b.idx, text: it.b.ref, at: [x, y - it.h - 3] });
-    rank.set(it.b.idx, items.length > 1 ? i / (items.length - 1) : 0);
-    x += it.slot + gap;
-    rowH = Math.max(rowH, it.h);
+    const c = i % cols, r = Math.floor(i / cols);
+    const tx = colX[c] + colW[c] / 2, ty = rowY[r] - rowH[r] / 2; // centre of the cell
+    offsets.set(it.b.idx, [tx - it.cx, ty - it.cy]);
+    labels.push({ idx: it.b.idx, text: it.b.ref, at: [tx, rowY[r] - rowH[r] - 2] });
+    rank.set(it.b.idx, n > 1 ? i / (n - 1) : 0);
   });
-  const height = -(y - rowH);
-  // Centre the sheet on the site.
-  const cx = rowW / 2, cy = -height / 2;
-  for (const [k, v] of offsets) offsets.set(k, [v[0] - cx, v[1] - cy]);
-  for (const l of labels) l.at = [l.at[0] - cx, l.at[1] - cy];
-  return { offsets, rank, labels, bounds: { minX: -cx - gap, maxX: rowW - cx + gap, minY: -height - cy - label - gap, maxY: -cy + gap } };
+  return { offsets, rank, labels, bounds: { minX: -W / 2 - gap, maxX: W / 2 + gap, minY: -H / 2 - gap, maxY: H / 2 + gap } };
 }
 
 /** Move a building's lng/lat geometry by a local-metre offset. */
