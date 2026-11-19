@@ -66,7 +66,7 @@ export async function openPassport(b: Bldg, ctx: PassportCtx, host: HTMLElement)
   host.querySelector('.pp-sheet')!.innerHTML = `
   <header class="pp-head">
     <div><h1>${b.ref} ${esc(name || use)}</h1><p>${esc(use)}${street ? ` · ${esc(street)}` : ''}${place ? `, ${esc(place)}` : ''}</p></div>
-    <div class="pp-meta">Building passport<br>${esc([street, place].filter(Boolean).join(', '))}<br>${today}</div>
+    <div class="pp-meta">Building passport · Turley – Ultrahand<br>${esc([street, place].filter(Boolean).join(', '))}<br>${today}</div>
   </header>
   <div class="pp-grid">
     <div class="pp-col">

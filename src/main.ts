@@ -1036,7 +1036,13 @@ function safe<T>(fn: () => T, fb: T): T {
 }
 
 // ---------------------------------------------------------------- remember the last site (this browser only)
-const KEY = 'site-lab:last';
+const KEY = 'ultrahand:last';
+try {
+  // Carry over a site saved under the tool's old name.
+  const old = localStorage.getItem('site-lab:last');
+  if (old && !localStorage.getItem(KEY)) localStorage.setItem(KEY, old);
+  localStorage.removeItem('site-lab:last');
+} catch { /* storage blocked */ }
 function saveProject() {
   try {
     if (!S.red) return;
@@ -1065,4 +1071,4 @@ renderLayerList();
 renderLegend();
 applySun();
 // Exposed for debugging in the console.
-(window as any).siteLab = { map, S, setView, select, analyse, resetAll };
+(window as any).ultrahand = { map, S, setView, select, analyse, resetAll };

@@ -1,4 +1,6 @@
-# Site Lab (internal)
+# Turley – Ultrahand (internal)
+
+Design and constraints companion to Kaepora.
 
 A site analysis tool for England, built on Mapbox GL JS v3 and open data.
 
