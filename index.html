@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en-GB">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Site Lab</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Space+Grotesk:wght@500;700&family=JetBrains+Mono&display=swap" rel="stylesheet" />
+  </head>
+  <body>
+    <aside id="side">
+      <header class="brand"><b>Site Lab</b><span>England · internal</span></header>
+
+      <section class="step">
+        <h3><i>1</i> Find the place</h3>
+        <input id="search" type="search" placeholder="Address, postcode or place" autocomplete="off" />
+        <ul id="results"></ul>
+        <button class="link" id="example">Or try an example: Castlefield, Manchester</button>
+      </section>
+
+      <section class="step">
+        <h3><i>2</i> Red line</h3>
+        <div class="row">
+          <button id="drawRed" class="primary red">Draw red line</button>
+          <button id="editRed" disabled>Edit</button>
+          <button id="clearRed" disabled>Clear</button>
+        </div>
+        <label class="file">Import GeoJSON / KML<input id="importRed" type="file" accept=".geojson,.json,.kml" /></label>
+        <p class="hint" id="redHint">Click each corner of the site boundary. Double-click to finish.</p>
+        <p class="stat" id="redStat"></p>
+        <label class="inline">Proposed massing <input id="massing" type="number" min="0" max="300" step="1" value="0" /> m</label>
+      </section>
+
+      <section class="step">
+        <h3><i>3</i> Study area</h3>
+        <div class="seg" id="studyMode">
+          <button data-mode="buffer" class="on">Around the site</button>
+          <button data-mode="walk">Walking reach</button>
+          <button data-mode="draw">Draw</button>
+        </div>
+        <div data-for="buffer"><input id="bufferM" type="range" min="50" max="800" step="25" value="200" /> <span id="bufferLbl">200 m</span></div>
+        <div data-for="walk" hidden>
+          <div class="seg small" id="walkMin"><button data-v="5">5 min</button><button data-v="10" class="on">10 min</button><button data-v="15">15 min</button></div>
+        </div>
+        <div data-for="draw" hidden><button id="drawStudy">Draw study area</button></div>
+        <p class="stat" id="studyStat"></p>
+      </section>
+
+      <section class="step">
+        <h3><i>4</i> Show what's here</h3>
+        <button id="analyse" class="primary" disabled>Analyse site</button>
+        <p class="hint" id="progress"></p>
+      </section>
+
+      <section class="step" id="layersBox">
+        <h3>Layers</h3>
+        <div id="layers"></div>
+      </section>
+
+      <section class="step">
+        <h3>Sun and shadow</h3>
+        <div class="row"><input id="sunDate" type="date" /> <label class="inline"><input id="sunOn" type="checkbox" checked /> Shadows</label></div>
+        <input id="sunTime" type="range" min="300" max="1320" step="15" value="840" />
+        <p class="stat" id="sunStat"></p>
+      </section>
+
+      <section class="step">
+        <h3>Export</h3>
+        <div class="row wrap">
+          <select id="axoMode"><option value="ortho">Axo: match the view</option><option value="oblique">Plan oblique (true axo)</option></select>
+          <label class="inline"><input id="optPlinth" type="checkbox" checked /> Plinth</label>
+          <label class="inline"><input id="optLabels" type="checkbox" /> Refs</label>
+        </div>
+        <div class="row wrap">
+          <button id="expAxo" disabled>Axo drawing (SVG)</button>
+          <button id="expPlan" disabled>Plan (SVG)</button>
+          <button id="expPng">Map view (PNG)</button>
+        </div>
+      </section>
+    </aside>
+
+    <main id="mapWrap">
+      <div id="map"></div>
+      <nav id="views">
+        <button data-view="plan" class="on">Plan</button>
+        <button data-view="3d">3D</button>
+        <button data-view="axo">Axonometric</button>
+        <button data-view="eye">Eye level</button>
+        <span class="sep"></span>
+        <button id="rotL" title="Rotate 45° left">↺</button>
+        <button id="rotR" title="Rotate 45° right">↻</button>
+      </nav>
+    </main>
+
+    <aside id="info">
+      <div id="summary"><p class="muted">Draw a red line and press <b>Analyse site</b>. The site's facts appear here; click any building to read it.</p></div>
+      <div id="card" hidden></div>
+    </aside>
+
+    <svg id="leader" aria-hidden="true"></svg>
+    <div id="passport" hidden></div>
+    <div id="exportView" hidden></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
